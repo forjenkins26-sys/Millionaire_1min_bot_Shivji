@@ -114,7 +114,7 @@ MAX_PRE_ENTRY_SLIP_PTS = float(os.getenv("MAX_PRE_ENTRY_SLIP_PTS", "0.0"))  # le
 ENTRY_LIMIT_TIMEOUT_S  = int(os.getenv("ENTRY_LIMIT_TIMEOUT_S",  "45"))   # 1m: 45s (75% of bar); cancel if not filled
 ENTRY_LIMIT_MAX_DRIFT  = float(os.getenv("ENTRY_LIMIT_MAX_DRIFT", "0.0")) # 0 = auto (1.5 × sl_dist); cancel if price runs this far
 # Fixed SL/TP override — set both > 0 to use fixed pts instead of ATR-based
-FIXED_SL_PTS           = float(os.getenv("FIXED_SL_PTS", "200.0"))  # 200pts fixed SL for 1m bot
+FIXED_SL_PTS           = float(os.getenv("FIXED_SL_PTS", "150.0"))  # 150pts fixed SL for 1m bot
 FIXED_TP_PTS           = float(os.getenv("FIXED_TP_PTS", "200.0"))  # 200pts fixed TP for 1m bot
 
 PRICE_INTERVAL = 1   # seconds between position monitor ticks (1s = ~4pt worst-case SL slippage vs 9pt at 2s)
