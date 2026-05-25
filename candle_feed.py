@@ -1,0 +1,597 @@
+#!/usr/bin/env python3
+"""
+candle_feed.py — Delta Exchange WebSocket candle feed for Vol Surge v5 (1m)
+============================================================================
+Responsibilities (ONLY):
+  - Maintain a 300-candle ring buffer of closed 1-minute candles
+  - Maintain current mark price
+  - REST backfill on startup and after reconnect gaps
+  - Auto-reconnect with exponential backoff
+  - Emit closed candles via callback
+
+Does NOT:
+  - Execute trades
+  - Place orders
+  - Generate signals
+  - Modify any state outside this module
+
+Usage:
+    feed = CandleFeed(on_candle_close=my_callback)
+    asyncio.run(feed.start())
+"""
+
+import asyncio
+import json
+import logging
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+from typing import Callable, List, Optional
+
+import requests
+import websockets
+from websockets.exceptions import ConnectionClosed, WebSocketException
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+WS_URL   = "wss://socket.india.delta.exchange"
+REST_URL = "https://api.india.delta.exchange"
+SYMBOL   = "BTCUSD"
+
+_BACKOFF_INITIAL    = 1.0
+_BACKOFF_MAX        = 60.0
+_BACKOFF_MULT       = 2.0
+_HEARTBEAT_INTERVAL = 30.0   # seconds between keepalive pings to Delta
+
+CANDLE_SECONDS = 60    # 1-minute bars — used by scheduled close guard
+
+
+# ── Data model ────────────────────────────────────────────────────────────────
+
+@dataclass
+class Candle:
+    """One closed 1-minute candle."""
+    ts:     int    # candle start (Unix seconds, UTC)
+    open:   float
+    high:   float
+    low:    float
+    close:  float
+    volume: float
+
+    def __repr__(self) -> str:
+        from datetime import datetime, timezone
+        dt = datetime.fromtimestamp(self.ts, tz=timezone.utc)
+        return (
+            f"Candle({dt.strftime('%Y-%m-%d %H:%M UTC')}"
+            f" O={self.open:.1f} H={self.high:.1f}"
+            f" L={self.low:.1f} C={self.close:.1f})"
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "ts": self.ts, "open": self.open, "high": self.high,
+            "low": self.low, "close": self.close, "volume": self.volume,
+        }
+
+
+# ── CandleFeed ────────────────────────────────────────────────────────────────
+
+class CandleFeed:
+    """
+    Real-time buffer of closed 1-minute candles from Delta Exchange WebSocket.
+
+    Parameters
+    ----------
+    symbol          : trading symbol, default "BTCUSD"
+    buffer_size     : closed candles to keep in ring buffer, default 300
+    on_candle_close : callback(candle: Candle, buffer: deque) on each closed bar
+    logger          : optional external logger
+    """
+
+    def __init__(
+        self,
+        symbol:          str = SYMBOL,
+        buffer_size:     int = 300,
+        on_candle_close: Optional[Callable] = None,
+        logger:          Optional[logging.Logger] = None,
+    ):
+        self.symbol      = symbol
+        self.buffer:     deque = deque(maxlen=buffer_size)
+        self.mark_price: Optional[float] = None
+        self.mark_price_updated_at: Optional[float] = None   # time.time() of last mark_price WS update
+        self.mark_price_event: threading.Event = threading.Event()  # set on every WS mark_price tick
+        self.best_bid:   Optional[float] = None   # l1_orderbook best bid (100ms updates)
+        self.best_ask:   Optional[float] = None   # l1_orderbook best ask (100ms updates)
+        self.exchange_status:   str  = "ok"    # system_status channel: "ok" | "degraded" | "maintenance"
+        self.exchange_degraded: bool = False   # True → skip new entries
+        self.last_closed: Optional[Candle] = None
+        self.connected:  bool = False
+
+        # Observability
+        self.last_frame_at:  Optional[float] = None   # time.time() of last WS frame
+        self.reconnect_count: int = 0
+
+        self._on_close   = on_candle_close
+        self._forming:   Optional[dict] = None    # candle currently forming from WS
+        self._warmed_up  = False
+        self._running    = False
+        self._raw_logged = False   # log first raw WS message for format debugging
+
+        self.log = logger or logging.getLogger("candle_feed")
+
+    # ── Public ────────────────────────────────────────────────────────────────
+
+    @property
+    def is_ready(self) -> bool:
+        """True when backfill loaded ≥ 250 bars (enough for EMA200 warmup on 1m)."""
+        return self._warmed_up and len(self.buffer) >= 250
+
+    async def start(self):
+        """
+        Backfill from REST, then connect to WebSocket.
+        Reconnects forever with exponential backoff on any disconnect.
+        """
+        self._running = True
+        self.log.info(f"[FEED] Starting for {self.symbol}")
+
+        await self._backfill(300)
+
+        # Proactive wall-clock watchdog: fires at exact bar boundaries regardless of WS latency.
+        # This eliminates the 6–7s entry slippage caused by delayed WS next-bar ticks.
+        asyncio.get_event_loop().create_task(self._bar_close_watchdog())
+
+        backoff = _BACKOFF_INITIAL
+        while self._running:
+            try:
+                self.log.info(f"[FEED] Connecting WebSocket -> {WS_URL}")
+                await self._ws_loop()
+                backoff = _BACKOFF_INITIAL
+            except (ConnectionClosed, WebSocketException, OSError) as e:
+                self.connected = False
+                self.log.warning(f"[FEED] WS disconnected: {e!r} — retry in {backoff:.0f}s")
+            except Exception as e:
+                self.connected = False
+                self.log.error(f"[FEED] WS error: {e!r} — retry in {backoff:.0f}s")
+
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * _BACKOFF_MULT, _BACKOFF_MAX)
+            self.reconnect_count += 1
+
+            if self.last_closed:
+                self.log.info("[FEED] Reconnected — filling gap from REST...")
+                await self._backfill_gap()
+
+    def stop(self):
+        self._running = False
+
+    # ── REST backfill ─────────────────────────────────────────────────────────
+
+    async def _backfill(self, count: int = 300):
+        self.log.info(f"[FEED] REST backfill: requesting {count} candles...")
+        try:
+            end_ts   = int(time.time())
+            start_ts = end_ts - count * 60 - 120    # 1-min bars (60s each) + small buffer
+
+            raw = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.get(
+                    f"{REST_URL}/v2/history/candles",
+                    params={
+                        "symbol":     self.symbol,
+                        "resolution": "1m",   # 1-minute candles
+                        "start":      start_ts,
+                        "end":        end_ts,
+                    },
+                    timeout=20,
+                ).json()
+            )
+
+            # Delta REST returns { result: [...] } newest-first (descending).
+            # We must reverse to oldest-first so buffer[-1] = newest = current bar.
+            candles_raw = raw.get("result", raw.get("data", []))
+            if not candles_raw:
+                self.log.warning(f"[FEED] Backfill returned empty. Raw preview: {str(raw)[:300]}")
+                self._warmed_up = True
+                return
+
+            now = int(time.time())
+            loaded = 0
+            for c in reversed(candles_raw):   # oldest → newest: buffer[-1] = current
+                candle = self._parse_rest_candle(c)
+                # Skip the currently forming bar — bar closes at ts + 60.
+                # If bar hasn't closed yet, exclude it so the WebSocket can
+                # emit the real close (avoids dedup-skipping the close callback).
+                if candle and candle.ts + 60 <= now:
+                    self.buffer.append(candle)
+                    self.last_closed = candle
+                    loaded += 1
+
+            self._warmed_up = True
+            self.log.info(
+                f"[FEED] Backfill complete — {loaded} candles loaded "
+                f"| buffer={len(self.buffer)} "
+                f"| oldest={self.buffer[0] if self.buffer else 'n/a'} "
+                f"| newest={self.buffer[-1] if self.buffer else 'n/a'}"
+            )
+
+        except Exception as e:
+            self.log.error(f"[FEED] Backfill error: {e}")
+            self._warmed_up = True   # still proceed — indicators will warn if data is thin
+
+    async def _backfill_gap(self):
+        if not self.last_closed:
+            await self._backfill(300)
+            return
+
+        gap_start  = self.last_closed.ts + 60
+        gap_end    = int(time.time())
+        gap_bars   = (gap_end - gap_start) // 60
+
+        if gap_bars < 1:
+            self.log.info("[FEED] Gap < 1 bar — no REST fill needed")
+            return
+
+        self.log.info(f"[FEED] Filling gap of ~{gap_bars} bars from REST...")
+        try:
+            raw = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.get(
+                    f"{REST_URL}/v2/history/candles",
+                    params={
+                        "symbol":     self.symbol,
+                        "resolution": "1m",   # 1-minute candles
+                        "start":      gap_start,
+                        "end":        gap_end,
+                    },
+                    timeout=20,
+                ).json()
+            )
+            # Delta returns newest-first — reverse for oldest-first append order
+            candles_raw = raw.get("result", raw.get("data", []))
+            now2 = int(time.time())
+            filled = 0
+            for c in reversed(candles_raw):
+                candle = self._parse_rest_candle(c)
+                # Only include bars that have fully closed (ts + 300 <= now)
+                if candle and candle.ts > self.last_closed.ts and candle.ts + 60 <= now2:
+                    self.buffer.append(candle)
+                    self.last_closed = candle
+                    filled += 1
+            self.log.info(f"[FEED] Gap fill complete — {filled} bars added")
+        except Exception as e:
+            self.log.error(f"[FEED] Gap fill error: {e}")
+
+    def _parse_rest_candle(self, raw: dict) -> Optional[Candle]:
+        try:
+            # Delta REST: 'time' or 'start' holds candle open timestamp
+            ts = int(raw.get("time", raw.get("start", raw.get("candle_start_time", 0))))
+            if ts == 0:
+                return None
+            # Some Delta endpoints return timestamps in ms
+            if ts > 1_000_000_000_000:
+                ts = ts // 1000
+            return Candle(
+                ts     = ts,
+                open   = float(raw.get("open",  0)),
+                high   = float(raw.get("high",  0)),
+                low    = float(raw.get("low",   0)),
+                close  = float(raw.get("close", 0)),
+                volume = float(raw.get("volume", raw.get("turnover", 0))),
+            )
+        except Exception as e:
+            self.log.debug(f"[FEED] parse_rest_candle skip: {e} | {raw}")
+            return None
+
+    # ── WebSocket loop ────────────────────────────────────────────────────────
+
+    async def _ws_loop(self):
+        async with websockets.connect(
+            WS_URL,
+            ping_interval=None,    # we manage heartbeats manually below
+            ping_timeout=None,
+            max_size=2 ** 20,
+            open_timeout=15,
+        ) as ws:
+            self.connected = True
+            self.log.info("[FEED] WebSocket connected (ok)")
+
+            await self._subscribe(ws)
+            hb_task = asyncio.create_task(self._heartbeat(ws))
+
+            try:
+                async for raw_frame in ws:
+                    try:
+                        if not self._raw_logged:
+                            self.log.info(f"[FEED] First WS frame (format debug): {raw_frame[:300]}")
+                            self._raw_logged = True
+                        msg = json.loads(raw_frame)
+                        self._dispatch(msg)
+                    except json.JSONDecodeError:
+                        self.log.debug(f"[FEED] Non-JSON frame: {raw_frame[:100]}")
+                    except Exception as e:
+                        self.log.warning(f"[FEED] dispatch error: {e}")
+            finally:
+                hb_task.cancel()
+                self.connected = False
+
+    async def _subscribe(self, ws):
+        sub = {
+            "type": "subscribe",
+            "payload": {
+                "channels": [
+                    {"name": "candlestick_1m", "symbols": [self.symbol]},   # 1-minute candles
+                    {"name": "mark_price",     "symbols": [self.symbol]},   # 2s fallback
+                    {"name": "l1_orderbook",   "symbols": [self.symbol]},   # 100ms best bid/ask
+                    {"name": "system_status"},                               # exchange degradation/maintenance
+                ]
+            }
+        }
+        await ws.send(json.dumps(sub))
+        self.log.info(f"[FEED] Subscribed to candlestick_1m + mark_price + l1_orderbook + system_status [{self.symbol}]")
+
+    async def _heartbeat(self, ws):
+        while True:
+            await asyncio.sleep(_HEARTBEAT_INTERVAL)
+            try:
+                await ws.send(json.dumps({"type": "heartbeat"}))
+                self.log.debug("[FEED] heartbeat ->")
+            except Exception:
+                break
+
+    # ── Message dispatch ──────────────────────────────────────────────────────
+
+    def _dispatch(self, msg: dict):
+        self.last_frame_at = time.time()
+        msg_type = str(msg.get("type", msg.get("channel", "")))
+
+        if "candlestick" in msg_type:
+            self._handle_candle(msg)
+        elif "l1_orderbook" in msg_type:
+            self._handle_l1_orderbook(msg)
+        elif "mark_price" in msg_type:
+            self._handle_mark_price(msg)
+        elif "system_status" in msg_type:
+            self._handle_system_status(msg)
+        elif msg_type in ("subscriptions", "heartbeat", "info", "welcome", "connected"):
+            self.log.debug(f"[FEED] ctrl: {msg_type}")
+        else:
+            self.log.debug(f"[FEED] unknown type={msg_type!r}: {str(msg)[:120]}")
+
+    def _handle_candle(self, msg: dict):
+        """
+        Process a WebSocket candlestick update.
+
+        Delta sends updates for the forming (open) candle multiple times.
+        We track by `start` timestamp. When a NEW start time arrives, the
+        previous candle is definitively closed.
+
+        Also handles explicit `closed: true` field if Delta provides it.
+        """
+        # Normalize: some Delta formats nest under "data", some are flat
+        data = msg.get("data", msg)
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        if not isinstance(data, dict):
+            return
+
+        try:
+            # Timestamp — may be seconds or milliseconds
+            raw_ts = int(
+                data.get("start",
+                data.get("candle_start_time",
+                data.get("open_time", 0)))
+            )
+            if raw_ts == 0:
+                return
+            if raw_ts > 1_000_000_000_000_000:   # microseconds → seconds
+                raw_ts = raw_ts // 1_000_000
+            elif raw_ts > 1_000_000_000_000:     # milliseconds → seconds
+                raw_ts = raw_ts // 1000
+
+            o = float(data.get("open",   0))
+            h = float(data.get("high",   0))
+            l = float(data.get("low",    0))
+            c = float(data.get("close",  0))
+            v = float(data.get("volume", data.get("turnover", 0)))
+
+            # Explicit closed flag — trust it if present
+            if bool(data.get("closed", False)):
+                self._emit_closed(Candle(ts=raw_ts, open=o, high=h, low=l, close=c, volume=v))
+                self._forming = None
+                return
+
+            # No explicit close — track by start time
+            if self._forming is None:
+                self._forming = dict(ts=raw_ts, open=o, high=h, low=l, close=c, volume=v)
+                self.log.debug(f"[FEED] forming ts={raw_ts}")
+                self._schedule_close_guard(raw_ts)   # force-close at bar_ts+60s if WS is slow
+                return
+
+            if raw_ts != self._forming["ts"]:
+                # New bar started — previous bar is done
+                f = self._forming
+                self._emit_closed(
+                    Candle(ts=f["ts"], open=f["open"], high=f["high"],
+                           low=f["low"], close=f["close"], volume=f["volume"])
+                )
+                self._forming = dict(ts=raw_ts, open=o, high=h, low=l, close=c, volume=v)
+                self._schedule_close_guard(raw_ts)   # guard for the new forming bar too
+            else:
+                # Same bar — update with latest tick
+                self._forming["high"]   = max(self._forming["high"], h)
+                self._forming["low"]    = min(self._forming["low"],  l)
+                self._forming["close"]  = c
+                self._forming["volume"] = v
+
+        except Exception as e:
+            self.log.warning(f"[FEED] _handle_candle error: {e} | {str(msg)[:120]}")
+
+    def _handle_l1_orderbook(self, msg: dict):
+        """
+        l1_orderbook channel — best bid/ask, updates every 100ms (20× faster than mark_price).
+        Use mid-price to update mark_price → position monitor wakes up 20× more frequently.
+        This reduces SL detection lag from ~2s to ~100ms.
+        """
+        try:
+            data = msg.get("data", msg)
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            bid = data.get("best_bid", data.get("buy_price",  None))
+            ask = data.get("best_ask", data.get("sell_price", None))
+            if bid and ask:
+                self.best_bid = float(bid)
+                self.best_ask = float(ask)
+                mid = round((self.best_bid + self.best_ask) / 2, 1)
+                self.mark_price            = mid
+                self.mark_price_updated_at = time.time()
+                self.mark_price_event.set()   # wake position monitor at 100ms cadence
+        except Exception as e:
+            self.log.debug(f"[FEED] l1_orderbook error: {e}")
+
+    def _handle_system_status(self, msg: dict):
+        """
+        system_status channel — exchange-wide degradation / maintenance alerts.
+        Sets exchange_degraded=True when status != "ok" / "operational".
+        _process_entry checks this flag and skips entries during degraded periods.
+        """
+        try:
+            data   = msg.get("data", msg)
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            status = str(data.get("status", data.get("state", "ok"))).lower()
+            prev   = self.exchange_degraded
+
+            # Delta Exchange healthy statuses confirmed in production:
+            #   "live", "ok", "operational", "normal", ""
+            # Degraded: "degraded", "partial_outage", "maintenance", "incident"
+            # IMPORTANT: "live" = Delta's normal operating status (NOT degraded!)
+            healthy = status in ("ok", "operational", "live", "normal", "active", "")
+            self.exchange_status   = status if status else "ok"
+            self.exchange_degraded = not healthy
+
+            if self.exchange_degraded and not prev:
+                self.log.warning(f"[FEED] ⚠️ Exchange DEGRADED — status={status!r} — entries will be skipped")
+            elif not self.exchange_degraded and prev:
+                self.log.info(f"[FEED] ✅ Exchange back to NORMAL — status={status!r}")
+        except Exception as e:
+            self.log.debug(f"[FEED] system_status error: {e}")
+
+    def _handle_mark_price(self, msg: dict):
+        try:
+            data  = msg.get("data", msg)
+            price = data.get("mark_price", data.get("price", data.get("close", None)))
+            if price:
+                # Only update if l1_orderbook not providing fresher data
+                # (l1_orderbook updates mark_price at 100ms; mark_price channel is 2s fallback)
+                self.mark_price            = float(price)
+                self.mark_price_updated_at = time.time()
+                self.mark_price_event.set()
+        except Exception as e:
+            self.log.debug(f"[FEED] mark_price error: {e}")
+
+    def _emit_closed(self, candle: Candle):
+        """Add to buffer, update last_closed, fire callback."""
+        # Dedup guard
+        if self.last_closed and candle.ts <= self.last_closed.ts:
+            self.log.debug(f"[FEED] Dedup skip ts={candle.ts}")
+            return
+
+        self.buffer.append(candle)
+        self.last_closed = candle
+        self.log.info(f"[FEED] CLOSED {candle}")
+
+        if self._on_close:
+            try:
+                self._on_close(candle, self.buffer)
+            except Exception as e:
+                self.log.error(f"[FEED] on_candle_close callback raised: {e}")
+
+    # ── Wall-clock bar close watchdog (primary) ───────────────────────────────
+
+    async def _bar_close_watchdog(self):
+        """
+        Proactive wall-clock bar close guard — fires at exact epoch boundaries.
+
+        Root cause of 6–7s slippage: _schedule_close_guard only starts when the
+        FIRST WS tick for a forming bar arrives. If WS is late, the guard starts
+        late and fires late. During volatile periods (when Vol Surge signals fire)
+        Delta WS next-bar tick can arrive 6–7s after bar end.
+
+        This watchdog runs independently of WS. It wakes every CANDLE_SECONDS
+        at exactly bar_ts + CANDLE_SECONDS + 200ms. If the bar wasn't naturally
+        closed by a WS tick, it force-closes from _forming state.
+
+        Result: signal latency drops from ~6700ms → ~200ms on slow-WS bars.
+        """
+        self.log.info(f"[FEED] ⏰ Wall-clock watchdog started (period={CANDLE_SECONDS}s)")
+        while self._running:
+            now          = time.time()
+            next_bar_end = (int(now) // CANDLE_SECONDS + 1) * CANDLE_SECONDS
+            wait         = next_bar_end - now + 0.2   # 200ms grace after bar end
+            await asyncio.sleep(wait)
+
+            bar_ts = next_bar_end - CANDLE_SECONDS
+
+            # Already naturally closed by WS tick (normal path)?
+            if self.last_closed and self.last_closed.ts >= bar_ts:
+                self.log.debug(f"[FEED] ⏰ watchdog ts={bar_ts}: WS closed naturally — OK")
+                continue
+
+            # Force-close from forming state
+            if self._forming and self._forming["ts"] == bar_ts:
+                f       = self._forming
+                elapsed = round(time.time() - next_bar_end, 3)
+                self.log.info(
+                    f"[FEED] ⏰ PROACTIVE CLOSE ts={bar_ts} "
+                    f"(wall-clock guard fired +{elapsed:.3f}s — WS tick was late)"
+                )
+                self._emit_closed(
+                    Candle(ts=f["ts"], open=f["open"], high=f["high"],
+                           low=f["low"], close=f["close"], volume=f["volume"])
+                )
+                self._forming = None
+            else:
+                self.log.info(
+                    f"[FEED] ⏰ watchdog ts={bar_ts}: no forming candle to close "
+                    f"(forming_ts={self._forming['ts'] if self._forming else None}, "
+                    f"last_closed_ts={self.last_closed.ts if self.last_closed else None})"
+                )
+
+    # ── Scheduled close guard (secondary / per-bar backup) ────────────────────
+
+    def _schedule_close_guard(self, bar_ts: int):
+        """Per-bar backup guard — belt-and-suspenders alongside the watchdog."""
+        try:
+            asyncio.get_running_loop().create_task(
+                self._scheduled_close_guard(bar_ts)
+            )
+        except RuntimeError:
+            pass
+
+    async def _scheduled_close_guard(self, bar_ts: int):
+        close_unix = bar_ts + CANDLE_SECONDS
+        delay      = close_unix - time.time() + 0.2
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        if self.last_closed and self.last_closed.ts >= bar_ts:
+            self.log.debug(f"[FEED] ⏰ per-bar guard ts={bar_ts}: already closed — OK")
+            return
+
+        if self._forming and self._forming["ts"] == bar_ts:
+            f       = self._forming
+            elapsed = round(time.time() - close_unix, 3)
+            self.log.info(
+                f"[FEED] ⏰ FORCED CLOSE ts={bar_ts} "
+                f"(WS next-bar tick not received — guard fired +{elapsed:.3f}s after bar end)"
+            )
+            self._emit_closed(
+                Candle(ts=f["ts"], open=f["open"], high=f["high"],
+                       low=f["low"], close=f["close"], volume=f["volume"])
+            )
+            self._forming = None
+        else:
+            self.log.debug(
+                f"[FEED] ⏰ per-bar guard ts={bar_ts}: _forming changed — skip "
+                f"(last_closed={self.last_closed.ts if self.last_closed else None})"
+            )
