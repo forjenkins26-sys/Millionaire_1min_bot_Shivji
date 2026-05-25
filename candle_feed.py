@@ -252,7 +252,7 @@ class CandleFeed:
             filled = 0
             for c in reversed(candles_raw):
                 candle = self._parse_rest_candle(c)
-                # Only include bars that have fully closed (ts + 300 <= now)
+                # Only include bars that have fully closed (ts + 60 <= now)
                 if candle and candle.ts > self.last_closed.ts and candle.ts + 60 <= now2:
                     self.buffer.append(candle)
                     self.last_closed = candle

@@ -94,15 +94,15 @@ SAFETY_FACTOR = float(os.getenv("SIGNAL_SAFETY_FACTOR", "1.0"))
 # Momentum Quality Filter A: Min Absolute Body
 # Blocks signal when candle body < MIN_BODY_PTS (same as Pine useMinBody/minBodyPts).
 # 250 pts confirmed better WR on BTC 5m historical — matches Pine setting.
-USE_MIN_BODY  = True    # Filter ON — block signals with body < 100 pts
-MIN_BODY_PTS  = 100.0   # Min body pts — 100pts for 1min bars (vs 250pts for 5m)
+USE_MIN_BODY  = True    # Filter ON — block signals with body < min pts
+MIN_BODY_PTS  = 50.0    # Min body pts — 50pts for 1min bars
 # Heikin-Ashi mode: MUST match TradingView chart type.
 # True  → 78% WR, 46 trades (HA chart in TradingView) ← confirmed better
 # False → 49% WR, 173 trades (regular candle chart)
 USE_HA        = os.getenv("USE_HA_CANDLES", "true").lower() == "true"
 # Stale-signal guard: skip entry if bar closed more than this many seconds ago.
 # Prevents entering on signals produced by forced-close after WS feed death.
-# 5m bar = 300s. Default 60s allows normal processing latency; anything beyond = stale.
+# 1m bar = 60s. Default 30s allows normal processing latency; anything beyond = stale.
 MAX_SIGNAL_AGE_S = int(os.getenv("MAX_SIGNAL_AGE_S", "30"))
 
 # ── Trade parameters ──────────────────────────────────────────────────
@@ -114,8 +114,8 @@ MAX_PRE_ENTRY_SLIP_PTS = float(os.getenv("MAX_PRE_ENTRY_SLIP_PTS", "0.0"))  # le
 ENTRY_LIMIT_TIMEOUT_S  = int(os.getenv("ENTRY_LIMIT_TIMEOUT_S",  "45"))   # 1m: 45s (75% of bar); cancel if not filled
 ENTRY_LIMIT_MAX_DRIFT  = float(os.getenv("ENTRY_LIMIT_MAX_DRIFT", "0.0")) # 0 = auto (1.5 × sl_dist); cancel if price runs this far
 # Fixed SL/TP override — set both > 0 to use fixed pts instead of ATR-based
-FIXED_SL_PTS           = float(os.getenv("FIXED_SL_PTS", "0.0"))   # 0 = dynamic (default)
-FIXED_TP_PTS           = float(os.getenv("FIXED_TP_PTS", "0.0"))   # 0 = dynamic (default)
+FIXED_SL_PTS           = float(os.getenv("FIXED_SL_PTS", "200.0"))  # 200pts fixed SL for 1m bot
+FIXED_TP_PTS           = float(os.getenv("FIXED_TP_PTS", "200.0"))  # 200pts fixed TP for 1m bot
 
 PRICE_INTERVAL = 1   # seconds between position monitor ticks (1s = ~4pt worst-case SL slippage vs 9pt at 2s)
 POS_MON_DELAY  = 3   # seconds to wait after entry before monitor starts
@@ -1475,7 +1475,7 @@ sig_cfg = SignalConfig(
     safety_factor  = SAFETY_FACTOR,
     use_ha         = USE_HA,     # True = Heikin-Ashi (78% WR), False = regular OHLC (49% WR)
     use_min_body   = USE_MIN_BODY,   # Filter A: block signals with body < MIN_BODY_PTS
-    min_body_pts   = MIN_BODY_PTS,   # 250.0 pts — matches Pine minBodyPts setting
+    min_body_pts   = MIN_BODY_PTS,   # 50.0 pts — 1min bar min body filter
 )
 
 engine = SignalEngine(config=sig_cfg, logger=logging.getLogger("signal_engine"))
@@ -1508,8 +1508,8 @@ def on_candle_close(candle: Candle, buffer: deque):
         return
 
     # ── Stale-signal guard ───────────────────────────────────────────
-    # If the WS feed died and the bar was force-closed late, sr.ts + 300 will
-    # be far in the past. Entering on a 27-min-old signal is wrong — price
+    # If the WS feed died and the bar was force-closed late, sr.ts + 60 will
+    # be far in the past. Entering on a 2-min-old signal is wrong — price
     # already moved, Delta rejects the order, and the trade would be stale.
     bar_close_epoch = sr.ts + 60           # 1m bar: open_ts + 60s = close_ts
     signal_age_s    = recv_time - bar_close_epoch
@@ -1589,8 +1589,10 @@ async def startup():
     log.info(f"  Symbol        : {SYMBOL}")
     log.info(f"  Product ID    : {PRODUCT_ID}")
     log.info(f"  LOT_SIZE      : {LOT_SIZE} BTC")
-    log.info(f"  TP model      : Single exit at {TP_R}R — fill-based")
-    log.info(f"  SL model      : Fixed stop-market — never moved")
+    _tp_log = f"FIXED {FIXED_TP_PTS:.0f}pts" if FIXED_TP_PTS > 0 else f"Dynamic {TP_R}R — fill-based"
+    _sl_log = f"FIXED {FIXED_SL_PTS:.0f}pts" if FIXED_SL_PTS > 0 else f"ATR-based ({SL_MULT}× sl_mult)"
+    log.info(f"  TP model      : {_tp_log}")
+    log.info(f"  SL model      : {_sl_log} — software stop-market")
     log.info(f"  Engine        : lookback={sig_cfg.lookback} burst_mult={sig_cfg.burst_mult}")
     log.info(f"                  sl_mult={sig_cfg.sl_mult} tp2_r={sig_cfg.tp2_r}")
     log.info(f"                  cooldown={sig_cfg.cooldown} safety_factor={sig_cfg.safety_factor}")
