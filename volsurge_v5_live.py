@@ -95,7 +95,9 @@ SAFETY_FACTOR = float(os.getenv("SIGNAL_SAFETY_FACTOR", "1.0"))
 # Blocks signal when candle body < MIN_BODY_PTS (same as Pine useMinBody/minBodyPts).
 # 250 pts confirmed better WR on BTC 5m historical — matches Pine setting.
 USE_MIN_BODY  = True    # Filter ON — block signals with body < min pts
-MIN_BODY_PTS  = 50.0    # Min body pts — 50pts for 1min bars
+MIN_BODY_PTS  = float(os.getenv("MIN_BODY_PTS", "50.0"))   # Min body pts
+USE_BREAKOUT_CTX = os.getenv("USE_BREAKOUT_CTX", "false").lower() == "true"
+BREAKOUT_CTX_BARS = int(os.getenv("BREAKOUT_CTX_BARS", "8"))
 # Heikin-Ashi mode: MUST match TradingView chart type.
 # True  → 78% WR, 46 trades (HA chart in TradingView) ← confirmed better
 # False → 49% WR, 173 trades (regular candle chart)
@@ -1506,8 +1508,10 @@ sig_cfg = SignalConfig(
     use_session    = USE_SESSION,
     safety_factor  = SAFETY_FACTOR,
     use_ha         = USE_HA,     # True = Heikin-Ashi (78% WR), False = regular OHLC (49% WR)
-    use_min_body   = USE_MIN_BODY,   # Filter A: block signals with body < MIN_BODY_PTS
-    min_body_pts   = MIN_BODY_PTS,   # 50.0 pts — 1min bar min body filter
+    use_min_body      = USE_MIN_BODY,
+    min_body_pts      = MIN_BODY_PTS,
+    use_breakout_ctx  = USE_BREAKOUT_CTX,
+    breakout_ctx_bars = BREAKOUT_CTX_BARS,
 )
 
 engine = SignalEngine(config=sig_cfg, logger=logging.getLogger("signal_engine"))
