@@ -146,6 +146,16 @@ flyctl ssh console --app millionare-shivji-1min-bot
 
 ---
 
+## Future Improvements
+
+- **Dynamic SL/TP based on chop + burst** — replace fixed 150/200pts with adaptive levels derived from live signal context:
+  - `SL = chopAvgTR × sl_mult` (ATR5[1] × 1.8 — same as Pine default)
+  - `TP = burst_threshold × tp_r` or `sl_dist × TP_R` anchored to fill price
+  - Rationale: fixed pts work for stable volatility regimes but underperform in low-vol (oversized SL) and high-vol (TP too close) markets. Dynamic levels auto-scale to current market conditions, matching the Pine script's original intent.
+  - All required values (`chop_avg_tr`, `burst_threshold`, `atr5_prev`) already logged per trade — no new data needed, just switch config flags `FIXED_SL_PTS=0` / `FIXED_TP_PTS=0`.
+
+---
+
 ## Related Bots
 
 | Bot | Folder | App | Timeframe |
