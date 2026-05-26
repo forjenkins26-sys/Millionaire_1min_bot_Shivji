@@ -4,7 +4,15 @@
 WebSocket-native trading bot for **BTCUSD Perpetual** on **Delta Exchange India**.
 Detects Vol Surge signals from live 1-minute candles — no TradingView webhook dependency.
 
-**Live URL:** https://millionare-shivji-1min-bot.fly.dev/dashboard
+## Dashboard Links
+
+| Bot | Timeframe | Dashboard URL |
+|---|---|---|
+| BTC 1min | 1m | https://millionare-shivji-1min-bot.fly.dev/dashboard |
+| BTC 5min | 5m | https://millionare-shivji-tradingbot.fly.dev/dashboard |
+| BTC 15min | 15m | https://millionare-shivji-15m-bot.fly.dev/dashboard |
+
+> Gold MT5 bot runs locally — no public URL.
 
 ---
 
