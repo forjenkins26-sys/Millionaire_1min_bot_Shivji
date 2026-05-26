@@ -1048,10 +1048,19 @@ def _position_monitor():
     Latency improvement:
       Before: REST poll every 1s  → up to 1000ms SL detection lag (~4pt slippage)
       After:  WS mark_price event → up to   50ms SL detection lag (<0.2pt slippage)
+
+    Stale-price guard (added 2026-05-27):
+      WS reconnect can deliver a stale mark_price as first tick (e.g. 77,334 when
+      real price is 75,832 — a 1,502pt artifact). This caused Trade #4 false SL.
+      Fix: track _last_valid_price; reject any tick jumping >500pts from last known
+      price. Log warning and wait for next tick to confirm real price.
     """
     global open_trade
     log.info("[MON] started")
     time.sleep(POS_MON_DELAY)
+
+    _last_valid_price = None   # track last sane price to detect stale WS reconnect ticks
+    _MAX_SANE_JUMP    = 500.0  # reject prices jumping >500pts (stale reconnect artifact)
 
     while True:
         # Wake on next WS mark_price tick; fall back to 1s if WS is silent
@@ -1070,6 +1079,20 @@ def _position_monitor():
             if not price:
                 _logw("[MON] price fetch failed — skipping tick")
                 continue
+
+            # ── Stale-price sanity check ──────────────────────────────────────
+            # First tick after WS reconnect can be a stale/cached price that is
+            # thousands of points away from reality. Skip and wait for next tick.
+            if _last_valid_price is not None:
+                jump = abs(price - _last_valid_price)
+                if jump > _MAX_SANE_JUMP:
+                    _logw(f"[MON] PRICE SANITY REJECT | price={price:.2f} "
+                          f"last={_last_valid_price:.2f} jump={jump:.1f}pts "
+                          f"> {_MAX_SANE_JUMP:.0f}pt limit — likely stale WS reconnect tick")
+                    continue  # skip — do NOT update _last_valid_price; wait for next tick
+
+            _last_valid_price = price
+            # ─────────────────────────────────────────────────────────────────
 
             open_trade["monitor_cycles"] = open_trade.get("monitor_cycles", 0) + 1
 
