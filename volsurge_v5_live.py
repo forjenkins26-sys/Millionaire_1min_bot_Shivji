@@ -919,7 +919,7 @@ def _set_open_trade(
     _sl_mode       = f"FIXED {FIXED_SL_PTS:.0f}pts" if FIXED_SL_PTS > 0 else "ATR"
     _tp_mode       = f"FIXED {FIXED_TP_PTS:.0f}pts" if FIXED_TP_PTS > 0 else f"{TP_R}R"
     tg(
-        f"{'📄 PAPER' if PAPER_MODE else '🟢 LIVE'} <b>{d} ENTERED</b> [v5 5m WebSocket]\n"
+        f"{'📄 PAPER' if PAPER_MODE else '🟢 LIVE'} <b>{d} ENTERED</b> [v5 1m WebSocket]\n"
         f"Fill: <b>{fill_price:,.1f}</b> | Slip: {entry_slippage:+.2f}pts\n"
         f"SL: {sl_price:,.1f} [{_sl_mode}] | TP: {tp_price:,.1f} [{_tp_mode}]\n"
         f"Bar close: {_bar_close_ist} IST | Fill: {_fill_ist} IST\n"
