@@ -168,6 +168,11 @@ _state_lock        = threading.Lock()
 _entry_processing  = False
 _preflight_ok      = False
 
+# Incremental Heikin-Ashi state (Pine-exact, seeded from backfill on first bar)
+_ha_open_prev:  Optional[float] = None
+_ha_close_prev: Optional[float] = None
+_ha_buffer:     deque           = deque(maxlen=300)
+
 # Sentinel returned by get_open_position() when the API call itself fails.
 # Distinct from None (= "no open position, call succeeded").
 _POS_API_ERROR = object()
@@ -1507,7 +1512,7 @@ sig_cfg = SignalConfig(
     use_ema_filter = USE_EMA_FILT,
     use_session    = USE_SESSION,
     safety_factor  = SAFETY_FACTOR,
-    use_ha         = USE_HA,     # True = Heikin-Ashi (78% WR), False = regular OHLC (49% WR)
+    use_ha         = False,      # HA computed incrementally (Pine-exact); engine sees pre-converted HA candles
     use_min_body      = USE_MIN_BODY,
     min_body_pts      = MIN_BODY_PTS,
     use_breakout_ctx  = USE_BREAKOUT_CTX,
@@ -1517,20 +1522,64 @@ sig_cfg = SignalConfig(
 engine = SignalEngine(config=sig_cfg, logger=logging.getLogger("signal_engine"))
 
 
+def _rc_to_ha(rc: Candle) -> Candle:
+    """Convert one real candle to HA using global incremental state (Pine-exact)."""
+    global _ha_open_prev, _ha_close_prev
+    ha_close = (rc.open + rc.high + rc.low + rc.close) / 4.0
+    if _ha_open_prev is None:
+        ha_open = (rc.open + rc.close) / 2.0
+    else:
+        ha_open = (_ha_open_prev + _ha_close_prev) / 2.0
+    ha_high = max(rc.high, ha_open, ha_close)
+    ha_low  = min(rc.low,  ha_open, ha_close)
+    _ha_open_prev  = ha_open
+    _ha_close_prev = ha_close
+    return Candle(
+        ts=rc.ts,
+        open=round(ha_open, 2),  high=round(ha_high, 2),
+        low=round(ha_low,   2),  close=round(ha_close, 2),
+        volume=rc.volume,
+    )
+
+
+def _seed_ha_from_buffer(buffer: deque):
+    """Seed _ha_buffer + HA state by replaying all backfilled real candles."""
+    global _ha_open_prev, _ha_close_prev, _ha_buffer
+    _ha_open_prev  = None
+    _ha_close_prev = None
+    _ha_buffer.clear()
+    for rc in buffer:
+        _ha_buffer.append(_rc_to_ha(rc))
+    log.info(
+        f"[HA] Seeded from {len(buffer)} candles — "
+        f"ha_open_prev={_ha_open_prev:.1f} ha_close_prev={_ha_close_prev:.1f}"
+    )
+
+
 def on_candle_close(candle: Candle, buffer: deque):
     """
     Called by CandleFeed on every confirmed 1m bar close.
     Runs in the asyncio event loop thread — must not block.
     Entry processing spawned in a daemon thread.
     """
-    global _entry_processing
+    global _entry_processing, _ha_open_prev
+
+    # ── Incremental HA (Pine-exact) ───────────────────────────────────────
+    # First call: seed HA state from entire backfilled buffer (incl. current bar).
+    # Subsequent calls: compute HA for the single new bar incrementally.
+    if _ha_open_prev is None:
+        _seed_ha_from_buffer(buffer)   # buffer already contains current bar
+        ha_candle = _ha_buffer[-1]
+    else:
+        ha_candle = _rc_to_ha(candle)
+        _ha_buffer.append(ha_candle)
 
     # Pass in_trade=True when bot already has an open position.
     # This prevents the engine from firing a signal during an active trade.
     with _state_lock:
         currently_in_trade = open_trade is not None or _entry_processing
 
-    state = engine.on_candle_close(candle, buffer, in_trade=currently_in_trade)
+    state = engine.on_candle_close(ha_candle, _ha_buffer, in_trade=currently_in_trade)
     if state is None:
         return
 
