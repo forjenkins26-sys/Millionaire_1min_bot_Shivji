@@ -96,7 +96,7 @@ SAFETY_FACTOR = float(os.getenv("SIGNAL_SAFETY_FACTOR", "1.0"))
 # Blocks signal when candle body < MIN_BODY_PTS (same as Pine useMinBody/minBodyPts).
 # 250 pts confirmed better WR on BTC 5m historical — matches Pine setting.
 USE_MIN_BODY  = True    # Filter ON — block signals with body < min pts
-MIN_BODY_PTS  = float(os.getenv("MIN_BODY_PTS", "50.0"))   # Min body pts
+MIN_BODY_PTS  = float(os.getenv("MIN_BODY_PTS", "250.0"))  # Min body pts — 250pts = 82.9% WR (vs 60.1% at 50pts)
 USE_BREAKOUT_CTX = os.getenv("USE_BREAKOUT_CTX", "false").lower() == "true"
 BREAKOUT_CTX_BARS = int(os.getenv("BREAKOUT_CTX_BARS", "8"))
 # Heikin-Ashi mode: MUST match TradingView chart type.
