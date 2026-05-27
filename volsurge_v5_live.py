@@ -52,6 +52,7 @@ from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 
 from candle_feed import CandleFeed, Candle
 from signal_engine import SignalEngine, SignalConfig, SignalResult
+from private_ws import PrivateFeed
 
 # ════════════════════════════════════════════════════════════════════════
 # .env SUPPORT
@@ -172,6 +173,9 @@ _preflight_ok      = False
 _ha_open_prev:  Optional[float] = None
 _ha_close_prev: Optional[float] = None
 _ha_buffer:     deque           = deque(maxlen=300)
+
+# Private WebSocket feed — orders + trades channels for instant fill detection
+private_feed: Optional[PrivateFeed] = None
 
 # Sentinel returned by get_open_position() when the API call itself fails.
 # Distinct from None (= "no open position, call succeeded").
@@ -656,6 +660,90 @@ def place_tp_order(close_side: str, size: float, tp_price: float,
     _loge(f"TP order failed: {resp}")
     return None
 
+def place_bracket_order(
+    direction: str,
+    sl_price:  float,
+    tp_price:  float,
+) -> Optional[dict]:
+    """
+    Attach server-side SL (stop-market) + TP (limit) to the open position.
+    Uses /v2/orders/bracket — single API call replacing place_sl_order + place_tp_order.
+
+    SL: stop-market (triggers market close when price hits sl_price — survives bot crash).
+    TP: limit order (fills at tp_price or better).
+
+    Bracket order closes ENTIRE open position — no size field needed.
+
+    Returns:
+        dict  — {"bracket_placed": True, "sl_price": ..., "tp_price": ...,
+                  "sl_oid": ..., "tp_oid": ..., "placed_time": ...}
+        None  — placement failed (caller falls back to software SL + TP limit)
+    """
+    body = {
+        "product_id":     PRODUCT_ID,
+        "product_symbol": SYMBOL,
+        "stop_loss_order": {
+            "order_type": "market_order",
+            "stop_price": str(round(sl_price, 1)),
+        },
+        "take_profit_order": {
+            "order_type": "limit_order",
+            "stop_price": str(round(tp_price, 1)),
+            "limit_price": str(round(tp_price, 1)),
+        },
+        "bracket_stop_trigger_method": "last_traded_price",
+    }
+
+    resp = _post("/v2/orders/bracket", body)
+
+    if not resp:
+        _loge("[BRACKET] No response from /v2/orders/bracket")
+        return None
+
+    if not (resp.get("success") or resp.get("result")):
+        _loge(f"[BRACKET] Placement failed: {resp}")
+        return None
+
+    _log(f"[BRACKET] Placed | dir={direction} SL={sl_price} TP={tp_price}")
+
+    # Query open orders to find bracket sub-order IDs (TP is reduce_only limit)
+    tp_oid = None
+    sl_oid = None
+    try:
+        time.sleep(0.3)   # brief wait for Delta backend to register sub-orders
+        open_orders = get_open_orders()
+        for o in open_orders:
+            if str(o.get("product_id", "")) != str(PRODUCT_ID):
+                continue
+            if not o.get("reduce_only"):
+                continue
+            lp  = float(o.get("limit_price", 0) or 0)
+            sp  = float(o.get("stop_price",  0) or 0)
+            ot  = o.get("order_type", "")
+
+            # TP: limit order near tp_price
+            if ot == "limit_order" and lp > 0 and abs(lp - tp_price) < 10.0:
+                tp_oid = str(o.get("id", ""))
+                _log(f"[BRACKET] TP sub-order found: oid={tp_oid} px={lp}")
+
+            # SL: stop order near sl_price
+            elif sp > 0 and abs(sp - sl_price) < 10.0:
+                sl_oid = str(o.get("id", ""))
+                _log(f"[BRACKET] SL sub-order found: oid={sl_oid} stop={sp}")
+
+    except Exception as e:
+        _logw(f"[BRACKET] Sub-order ID query failed (non-fatal): {e}")
+
+    return {
+        "bracket_placed": True,
+        "sl_price":       sl_price,
+        "tp_price":       tp_price,
+        "sl_oid":         sl_oid,
+        "tp_oid":         tp_oid,
+        "placed_time":    time.time(),
+    }
+
+
 def cancel_order(order_id: str, retries: int = 3, delay: float = 1.5) -> bool:
     for attempt in range(1, retries + 1):
         _delete(f"/v2/orders/{order_id}")
@@ -1120,95 +1208,135 @@ def _position_monitor():
 
             else:
                 # ── LIVE monitor ──────────────────────────────────────────────
-                # Delta Exchange India /v2/orders only accepts limit_order and
-                # market_order — stop_market_order is rejected with bad_schema.
-                # Therefore SL is enforced here in software every 2s tick.
-                # TP is still an exchange limit order (works fine).
+                # Primary exit detection: Private WS 'orders' channel fires instantly
+                # when bracket TP limit fills or SL stop-market triggers.
+                #
+                # Software SL remains as crash-safe fallback: if WS is silent but
+                # price breaches SL level on mark_price tick, fire market close.
+                # This handles: WS disconnect, bracket order not placed (fallback mode).
+                #
+                # REST position poll kept but throttled to every 10 monitor cycles
+                # to catch any exits missed by both WS and software SL.
 
-                # 1. Software SL check — fire market close if price breaches SL
+                # 1. Check Private WS for order fill events (TP or SL bracket hit)
+                _pf = private_feed   # local ref — thread-safe read of module global
+                if _pf and _pf.order_event.is_set():
+                    _pf.order_event.clear()
+                    evt = _pf.last_order
+                    if evt:
+                        evt_product = str(evt.get("product_id", ""))
+                        evt_state   = str(evt.get("state", ""))
+                        evt_reduce  = bool(evt.get("reduce_only", False))
+                        if (evt_product == str(PRODUCT_ID)
+                                and evt_reduce
+                                and evt_state in ("filled", "closed")):
+                            raw_fill     = evt.get("average_fill_price") or evt.get("limit_price")
+                            fill_px_exit = round(float(raw_fill), 1) if raw_fill else price
+                            oid_exit     = str(evt.get("id", ""))
+
+                            # Classify TP vs SL by comparing fill to expected levels
+                            dist_tp = abs(fill_px_exit - tp)
+                            dist_sl = abs(fill_px_exit - sl)
+                            if dist_tp <= dist_sl:
+                                exit_label = "TP_BRACKET"
+                                slip       = round(abs(fill_px_exit - tp), 2)
+                            else:
+                                exit_label = "SL_BRACKET"
+                                slip       = round(abs(fill_px_exit - sl), 2)
+
+                            open_trade["exit_order_id"]      = oid_exit
+                            open_trade["exit_fill_px_delta"] = fill_px_exit
+                            _log_lifecycle(open_trade["trade_id"], "EXIT_CONFIRMED",
+                                           order_id=oid_exit, price=fill_px_exit, notes=exit_label)
+                            _log(
+                                f"[MON] WS exit | {exit_label} fill={fill_px_exit} "
+                                f"oid={oid_exit} dist_tp={dist_tp:.1f} dist_sl={dist_sl:.1f}"
+                            )
+                            _close_trade(fill_px_exit, exit_label, slip)
+                            break
+
+                # 2. Software SL check — safety net if bracket not placed or WS silent
                 hit_sl = (d == "BUY" and price <= sl) or (d == "SELL" and price >= sl)
                 if hit_sl:
                     _logw(f"[MON] SOFTWARE SL HIT | price={price} sl={sl} d={d}")
                     _log_lifecycle(open_trade["trade_id"], "SL_SOFTWARE_TRIGGERED",
                                    price=price, notes=f"sl_level={sl}")
-                    tg(f"🛑 <b>SL HIT (software)</b> [{d}]\n"
+                    tg(f"🛑 <b>SL HIT (software fallback)</b> [{d}]\n"
                        f"Price: {price:,.1f} | SL: {sl:,.1f}\n"
                        f"Placing market close...")
 
                     # IMPORTANT: Fire market close FIRST — every ms counts.
-                    # Cancel TP in a background thread concurrently so the
-                    # blocking DELETE call does not delay the market order.
-                    close_side = "sell" if d == "BUY" else "buy"
-                    tp_oid = open_trade.get("tp_oid")
+                    # Cancel TP in a background thread so DELETE doesn't delay market order.
+                    close_side  = "sell" if d == "BUY" else "buy"
+                    tp_oid_val  = open_trade.get("tp_oid")
 
                     def _cancel_tp_bg():
-                        if tp_oid:
-                            _delete(f"/v2/orders/{tp_oid}")
-                            _log(f"[MON] TP order {tp_oid} cancelled (background) on SL trigger")
+                        if tp_oid_val:
+                            _delete(f"/v2/orders/{tp_oid_val}")
+                            _log(f"[MON] TP order {tp_oid_val} cancelled (background) on SL trigger")
 
                     threading.Thread(target=_cancel_tp_bg, daemon=True, name="tp-cancel-sl").start()
 
-                    # Place market close immediately (reduce-only)
                     close_result = place_market_order(close_side, LOT_SIZE,
                                                       reduce_only=True, ref_price=price)
                     if close_result:
                         exit_px = round(float(close_result.get("fill_price") or price), 1)
                     else:
-                        _loge("[MON] SL market close order FAILED — retrying once")
+                        _loge("[MON] SL market close FAILED — retrying once")
                         time.sleep(0.5)
                         close_result2 = place_market_order(close_side, LOT_SIZE,
                                                            reduce_only=True, ref_price=price)
                         exit_px = round(float((close_result2 or {}).get("fill_price") or price), 1)
 
                     slip = round(abs(exit_px - sl), 2)
-                    open_trade["exit_order_id"]     = (close_result or {}).get("order_id")
+                    open_trade["exit_order_id"]      = (close_result or {}).get("order_id")
                     open_trade["exit_fill_px_delta"] = exit_px
                     _close_trade(exit_px, "SL_SOFTWARE", slip)
                     break
 
-                # 2. TP / flat detection — check if exchange closed the position
-                pos = get_open_position()
-                if pos is _POS_API_ERROR:
-                    _logw("[MON] get_open_position API error — skip tick, not treating as flat")
-                    continue
-                if pos is None:
-                    _logw(f"[LIVE] Position flat @ approx price={price}")
-                    _log_lifecycle(open_trade["trade_id"], "MONITOR_FLAT", notes=f"approx={price}")
+                # 3. REST position poll (throttled) — catch exits missed by WS + software SL
+                _mc = open_trade.get("monitor_cycles", 0)
+                if _mc % 10 == 0:
+                    pos = get_open_position()
+                    if pos is _POS_API_ERROR:
+                        _logw("[MON] get_open_position API error — skip tick")
+                        continue
+                    if pos is None:
+                        _logw(f"[LIVE] Position flat (REST poll) | approx price={price}")
+                        _log_lifecycle(open_trade["trade_id"], "MONITOR_FLAT", notes=f"approx={price}")
 
-                    exit_fill_px  = price
-                    exit_order_id = None
-                    exit_label    = "AUTO_EXIT"
+                        exit_fill_px  = price
+                        exit_order_id = None
+                        exit_label    = "AUTO_EXIT"
 
-                    # Check if TP limit order was filled
-                    tp_oid = open_trade.get("tp_oid")
-                    if tp_oid:
-                        order_resp = _get(f"/v2/orders/{tp_oid}")
-                        if order_resp:
-                            result_data = order_resp.get("result", {})
-                            if result_data.get("state") in ("filled", "closed"):
-                                raw_fill = result_data.get("average_fill_price")
-                                if raw_fill:
-                                    exit_fill_px  = float(raw_fill)
-                                    exit_order_id = tp_oid
-                                    exit_label    = "TP_LIVE"
-                                    _log(f"[LIVE] TP confirmed oid={tp_oid} fill={exit_fill_px}")
-                                    _log_lifecycle(open_trade["trade_id"], "EXIT_CONFIRMED",
-                                                   order_id=tp_oid, price=exit_fill_px, notes="TP_LIVE")
+                        tp_oid_val = open_trade.get("tp_oid")
+                        if tp_oid_val:
+                            order_resp = _get(f"/v2/orders/{tp_oid_val}")
+                            if order_resp:
+                                result_data = order_resp.get("result", {})
+                                if result_data.get("state") in ("filled", "closed"):
+                                    raw_fill = result_data.get("average_fill_price")
+                                    if raw_fill:
+                                        exit_fill_px  = float(raw_fill)
+                                        exit_order_id = tp_oid_val
+                                        exit_label    = "TP_LIVE"
+                                        _log(f"[LIVE] TP confirmed oid={tp_oid_val} fill={exit_fill_px}")
+                                        _log_lifecycle(open_trade["trade_id"], "EXIT_CONFIRMED",
+                                                       order_id=tp_oid_val, price=exit_fill_px, notes="TP_LIVE")
 
-                    open_trade["exit_order_id"]      = exit_order_id
-                    open_trade["exit_fill_px_delta"]  = exit_fill_px
+                        open_trade["exit_order_id"]      = exit_order_id
+                        open_trade["exit_fill_px_delta"] = exit_fill_px
 
-                    # Cancel any remaining orders
-                    for oid_key in ("sl_oid", "tp_oid"):
-                        oid = open_trade.get(oid_key)
-                        if oid and oid != exit_order_id:
-                            _delete(f"/v2/orders/{oid}")
-                            _log_lifecycle(open_trade["trade_id"],
-                                           f"{oid_key.upper().replace('_OID','')}_CANCELLED",
-                                           order_id=oid)
+                        for oid_key in ("sl_oid", "tp_oid"):
+                            oid = open_trade.get(oid_key)
+                            if oid and oid != exit_order_id:
+                                _delete(f"/v2/orders/{oid}")
+                                _log_lifecycle(open_trade["trade_id"],
+                                               f"{oid_key.upper().replace('_OID','')}_CANCELLED",
+                                               order_id=oid)
 
-                    _close_trade(exit_fill_px, exit_label, 0.0)
-                    break
+                        _close_trade(exit_fill_px, exit_label, 0.0)
+                        break
 
     log.info("[MON] stopped")
 
@@ -1393,35 +1521,50 @@ def _process_entry(
                 sl_price = round(_mark - _sl_buffer, 1)
                 _logw(f"SL stop price adjusted to {sl_price} (below mark {_mark}) to avoid rejection")
 
-            # ── Parallel SL + TP placement ────────────────────────────────
-            import concurrent.futures as _cf
-            with _cf.ThreadPoolExecutor(max_workers=2) as _pool:
-                _sl_fut = _pool.submit(place_sl_order, close_side, LOT_SIZE, sl_price, entry_contracts)
-                _tp_fut = _pool.submit(place_tp_order, close_side, LOT_SIZE, tp_price, entry_contracts)
-                sl_result = _sl_fut.result()
-                tp_result = _tp_fut.result()
+            # ── Bracket order: server-side SL stop-market + TP limit ──────
+            # Single /v2/orders/bracket call — replaces separate SL + TP placement.
+            # If bracket succeeds: Delta manages SL + TP server-side (survives bot crash).
+            # If bracket fails: fall back to software SL + TP limit (existing behaviour).
+            bracket_result = place_bracket_order(d, sl_price, tp_price)
 
-            sl_oid      = sl_result["order_id"]   if sl_result else None
-            sl_placed_t = sl_result["placed_time"] if sl_result else None
-            tp_oid      = tp_result["order_id"]   if tp_result else None
-            tp_placed_t = tp_result["placed_time"] if tp_result else None
+            if bracket_result and bracket_result.get("bracket_placed"):
+                sl_oid      = bracket_result.get("sl_oid")
+                tp_oid      = bracket_result.get("tp_oid")
+                sl_placed_t = bracket_result.get("placed_time")
+                tp_placed_t = bracket_result.get("placed_time")
+                _log(
+                    f"[BRACKET] ✅ Server-side SL+TP placed | "
+                    f"sl={sl_price} sl_oid={sl_oid} | tp={tp_price} tp_oid={tp_oid}"
+                )
+                tg(
+                    f"🔒 <b>BRACKET ORDER PLACED</b> [{d}]\n"
+                    f"SL: {sl_price:,.1f} (exchange stop-market — server-side)\n"
+                    f"TP: {tp_price:,.1f} (exchange limit — server-side)\n"
+                    f"Exits are safe during disconnects ✓"
+                )
+            else:
+                # Bracket failed — fall back to legacy TP limit + software SL
+                _logw("[BRACKET] Failed — falling back to TP limit + software SL")
+                import concurrent.futures as _cf
+                with _cf.ThreadPoolExecutor(max_workers=2) as _pool:
+                    _sl_fut = _pool.submit(place_sl_order, close_side, LOT_SIZE, sl_price, entry_contracts)
+                    _tp_fut = _pool.submit(place_tp_order, close_side, LOT_SIZE, tp_price, entry_contracts)
+                    sl_result = _sl_fut.result()
+                    tp_result = _tp_fut.result()
 
-            # sl_oid is always None — Delta India does not support stop_market_order.
-            # SL is enforced by the software position monitor (_position_monitor).
-            # No alert needed here — the ENTERED Telegram message already shows SW⚡ SL level.
-            if sl_oid:
-                # Future-proof: if exchange SL ever gets placed, log it
-                _log(f"[SL] Exchange SL order placed oid={sl_oid} @ {sl_price}")
+                sl_oid      = sl_result["order_id"]   if sl_result else None
+                sl_placed_t = sl_result["placed_time"] if sl_result else None
+                tp_oid      = tp_result["order_id"]   if tp_result else None
+                tp_placed_t = tp_result["placed_time"] if tp_result else None
 
-            # TP placement failure alert — critical blind spot if TP order never reached Delta.
-            # Trade still runs (software SL protects it), but user must know immediately
-            # so they can manually place TP on Delta or decide to close.
-            if not tp_oid:
-                _loge(f"[TP] TP ORDER FAILED after {d} entry @ {fill_px} — no TP on Delta")
-                tg(f"⚠️ <b>TP ORDER FAILED</b> [{d}]\n"
-                   f"Entry: {fill_px:,.1f} | Expected TP: {tp_price:,.1f}\n"
-                   f"Trade is open — software SL @ {sl_price:,.1f} still active\n"
-                   f"Action: manually place SELL limit @ {tp_price:,.1f} on Delta or close trade")
+                if not tp_oid:
+                    _loge(f"[TP] TP ORDER FAILED (bracket + fallback both failed) after {d} entry @ {fill_px}")
+                    tg(
+                        f"⚠️ <b>TP ORDER FAILED (bracket + fallback both failed)</b> [{d}]\n"
+                        f"Entry: {fill_px:,.1f} | Expected TP: {tp_price:,.1f}\n"
+                        f"Trade open — software SL @ {sl_price:,.1f} active\n"
+                        f"Action: manually place SELL limit @ {tp_price:,.1f} on Delta"
+                    )
 
             # Write latency CSV immediately (crash-safe)
             try:
@@ -1722,6 +1865,21 @@ async def startup():
     asyncio.create_task(_feed_watchdog())
     asyncio.create_task(_preflight_retry_loop())   # auto-unblock entries if preflight failed at startup
     asyncio.create_task(_http_keepwarm())   # keep Delta REST TCP connection warm between trades
+
+    # Start private WebSocket feed (orders + user_trades channels)
+    # Only in LIVE mode — paper mode has no real order events to receive
+    if not PAPER_MODE and API_KEY and API_SECRET:
+        global private_feed
+        private_feed = PrivateFeed(
+            api_key    = API_KEY,
+            api_secret = API_SECRET,
+            symbol     = SYMBOL,
+            logger     = logging.getLogger("private_ws"),
+        )
+        asyncio.create_task(private_feed.start())
+        log.info("[STARTUP] Private WS feed started (orders + user_trades) ✓")
+    else:
+        log.info("[STARTUP] Private WS feed skipped (PAPER mode or no credentials)")
 
     # OOM / hard-crash orphan recovery — detects untracked Delta positions
     # that survived a Railway kill with no SIGTERM (only runs in LIVE mode)
