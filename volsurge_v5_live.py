@@ -50,7 +50,7 @@ import requests
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 
-from candle_feed import CandleFeed, Candle
+from candle_feed import CandleFeed, Candle, CANDLE_SECONDS
 from signal_engine import SignalEngine, SignalConfig, SignalResult
 from private_ws import PrivateFeed
 
@@ -119,6 +119,11 @@ ENTRY_LIMIT_MAX_DRIFT  = float(os.getenv("ENTRY_LIMIT_MAX_DRIFT", "0.0")) # 0 = 
 # Fixed SL/TP override — set both > 0 to use fixed pts instead of ATR-based
 FIXED_SL_PTS           = float(os.getenv("FIXED_SL_PTS", "150.0"))  # 150pts fixed SL for 1m bot
 FIXED_TP_PTS           = float(os.getenv("FIXED_TP_PTS", "200.0"))  # 200pts fixed TP for 1m bot
+MAX_DAILY_LOSS_PTS     = float(os.getenv("MAX_DAILY_LOSS_PTS",     "0"))  # 0=disabled; e.g. 500 = block new entries after -500pts/day
+MAX_ACCEPTABLE_SLIP_PTS= float(os.getenv("MAX_ACCEPTABLE_SLIP_PTS","0"))  # 0=disabled; TG alert if total entry+exit slip > this pts
+
+# Config signature appended to every Telegram alert — traces which setup made each trade
+CONFIG_TAG = f"MB{MIN_BODY_PTS:.0f} · {CANDLE_SECONDS//60}m · SL{FIXED_SL_PTS:.0f}/TP{FIXED_TP_PTS:.0f} · burst{VS_BURST_MULT}"
 
 PRICE_INTERVAL = 1   # seconds between position monitor ticks (1s = ~4pt worst-case SL slippage vs 9pt at 2s)
 POS_MON_DELAY  = 3   # seconds to wait after entry before monitor starts
@@ -168,6 +173,10 @@ open_trade:        Optional[dict] = None
 _state_lock        = threading.Lock()
 _entry_processing  = False
 _preflight_ok      = False
+
+# Daily drawdown circuit breaker state
+_daily_loss_pts  = 0.0   # cumulative SL pts today (resets midnight IST)
+_daily_loss_date = ""    # IST date string "YYYY-MM-DD"
 
 # Incremental Heikin-Ashi state (Pine-exact, seeded from backfill on first bar)
 _ha_open_prev:  Optional[float] = None
@@ -1014,19 +1023,20 @@ def _set_open_trade(
     _sl_mode       = f"FIXED {FIXED_SL_PTS:.0f}pts" if FIXED_SL_PTS > 0 else "ATR"
     _tp_mode       = f"FIXED {FIXED_TP_PTS:.0f}pts" if FIXED_TP_PTS > 0 else f"{TP_R}R"
     tg(
-        f"{'📄 PAPER' if PAPER_MODE else '🟢 LIVE'} <b>{d} ENTERED</b> [v5 1m WebSocket]\n"
+        f"{'📄 PAPER' if PAPER_MODE else '🟢 LIVE'} <b>{d} ENTERED</b> [{CANDLE_SECONDS//60}m WebSocket]\n"
         f"Fill: <b>{fill_price:,.1f}</b> | Slip: {entry_slippage:+.2f}pts\n"
         f"SL: {sl_price:,.1f} [{_sl_mode}] | TP: {tp_price:,.1f} [{_tp_mode}]\n"
         f"Bar close: {_bar_close_ist} IST | Fill: {_fill_ist} IST\n"
         f"Signal lat: {signal_latency_ms:.0f}ms | Entry lat: {entry_latency_ms:.0f}ms\n"
-        f"Structure: <b>{_grade}</b> | Chop: {chop_avg_tr:.1f} Burst: {burst_threshold:.1f}"
+        f"Structure: <b>{_grade}</b> | Chop: {chop_avg_tr:.1f} Burst: {burst_threshold:.1f}\n"
+        f"⚙️ {CONFIG_TAG}"
     )
 
 # ════════════════════════════════════════════════════════════════════════
 # CLOSE TRADE
 # ════════════════════════════════════════════════════════════════════════
 def _close_trade(exit_price: float, exit_type: str, exit_slippage: float = 0.0):
-    global open_trade
+    global open_trade, _daily_loss_pts, _daily_loss_date, _preflight_ok
     if not open_trade:
         return
 
@@ -1116,13 +1126,42 @@ def _close_trade(exit_price: float, exit_type: str, exit_slippage: float = 0.0):
     }
     _append_csv(SLIPPAGE_FILE, SLIPPAGE_HEADERS, _slip_row)
 
+    # ── Slippage alert ────────────────────────────────────────────────────
+    if MAX_ACCEPTABLE_SLIP_PTS > 0:
+        _total_slip = abs(trade.get("entry_slippage_pts", 0) or 0) + abs(exit_slippage)
+        if _total_slip > MAX_ACCEPTABLE_SLIP_PTS:
+            tg(
+                f"⚠️ <b>HIGH SLIPPAGE ALERT</b>\n"
+                f"Trade {trade.get('trade_id','?')} | {d} [{exit_type}]\n"
+                f"Entry slip: {trade.get('entry_slippage_pts', 0):.1f}pts | Exit slip: {exit_slippage:.1f}pts\n"
+                f"Total: <b>{_total_slip:.1f}pts</b> > limit {MAX_ACCEPTABLE_SLIP_PTS:.1f}pts"
+            )
+
+    # ── Daily drawdown circuit breaker ────────────────────────────────────
+    if MAX_DAILY_LOSS_PTS > 0 and pts < 0:
+        ist_today = (datetime.utcnow() + timedelta(seconds=19800)).strftime("%Y-%m-%d")
+        if _daily_loss_date != ist_today:
+            _daily_loss_pts  = 0.0
+            _daily_loss_date = ist_today
+        _daily_loss_pts += abs(pts)
+        if _daily_loss_pts >= MAX_DAILY_LOSS_PTS:
+            _preflight_ok = False
+            log.warning(f"[CIRCUIT_BREAKER] Daily loss {_daily_loss_pts:.1f}pts >= limit {MAX_DAILY_LOSS_PTS:.1f}pts — entries BLOCKED")
+            tg(
+                f"🚨 <b>DAILY CIRCUIT BREAKER TRIGGERED</b>\n"
+                f"Daily loss: <b>{_daily_loss_pts:.1f} pts</b> ≥ limit {MAX_DAILY_LOSS_PTS:.1f} pts\n"
+                f"All new entries BLOCKED for rest of day\n"
+                f"Resets at midnight IST"
+            )
+
     emoji = "✅" if pts > 0 else "🔴"
     _log(f"STATE→CLOSED | {d} exit={exit_price} pts={pts:+.2f} outcome={python_outcome}")
     tg(
         f"{emoji} <b>{d} CLOSED</b> [{exit_type}]\n"
         f"Entry: {entry_px:,.1f} → Exit: {exit_price:,.1f}\n"
         f"PnL: <b>{pts:+.2f}pts</b> | Outcome: <b>{python_outcome}</b>\n"
-        f"Structure: {trade.get('structure_grade','?')} | Duration: {trade_duration_sec}s"
+        f"Structure: {trade.get('structure_grade','?')} | Duration: {trade_duration_sec}s\n"
+        f"⚙️ {CONFIG_TAG}"
     )
 
     open_trade["state"] = STATE_CLOSED
@@ -1377,6 +1416,7 @@ def _process_entry(
         sl_oid  = tp_oid = None
         entry_order_id = api_request_time = api_ack_time = None
         sl_placed_t = tp_placed_t = None
+        entry_fill_time = None   # stamped at actual fill (live) or below (paper)
 
         if PAPER_MODE:
             fill_px = fetch_price()
@@ -1397,7 +1437,8 @@ def _process_entry(
             # price has already moved a full SL distance, making the trade
             # structurally broken (you'd be entering at the SL level of the signal).
             # Fixed guard (MAX_PRE_ENTRY_SLIP_PTS > 0) overrides this if set.
-            _cur_px = fetch_price()
+            # Use in-memory WS mark price (0ms) — avoids a ~400ms REST call before fill.
+            _cur_px = feed.mark_price or fetch_price()
             if _cur_px:
                 _pre_slip = (_cur_px - pine_entry_px) if d == "BUY" else (pine_entry_px - _cur_px)
                 if MAX_PRE_ENTRY_SLIP_PTS > 0:
@@ -1486,6 +1527,9 @@ def _process_entry(
                 # Step 3: mark_price (already in memory via WS — 0ms)
                 fill_px = feed.mark_price or fetch_price() or pine_entry_px
             fill_px = round(fill_px, 1)
+            # Stamp fill time HERE — the actual market fill is done. Bracket/SL
+            # placement below happens AFTER and must NOT inflate entry latency.
+            entry_fill_time = time.time()
 
             # ── Fixed SL/TP override ──────────────────────────────────────
             # When FIXED_SL_PTS > 0, use fixed pts instead of ATR-based sl_dist.
@@ -1512,7 +1556,7 @@ def _process_entry(
             # BUY stop (close SELL): stop_price must be ABOVE mark price.
             # SELL stop (close BUY): stop_price must be BELOW mark price.
             # Add a small safety buffer to ensure the order is accepted.
-            _mark = fetch_price() or fill_px
+            _mark = feed.mark_price or fetch_price() or fill_px
             _sl_buffer = max(sl_dist * 0.05, 2.0)   # 5% of SL dist or min 2 pts
             if d == "SELL" and sl_price <= _mark:
                 sl_price = round(_mark + _sl_buffer, 1)
@@ -1610,7 +1654,10 @@ def _process_entry(
                     cancel_all_open_orders()
                 return
 
-        entry_fill_time = time.time()
+        # entry_fill_time already stamped right after the fill (before bracket/SL).
+        # Fallback stamp for the PAPER path (which skips the live order block above).
+        if not entry_fill_time:
+            entry_fill_time = time.time()
 
         with _state_lock:
             _set_open_trade(
@@ -2755,6 +2802,7 @@ async def dashboard():
           <td>{_dir(t.get('direction',''))}</td>
           <td style="color:#d1d5db;font-size:11px;">{_dt(t.get('entry_fill_time',''))}</td>
           <td style="color:#9ca3af;text-align:center;">{t.get('signal_timeframe','—')}</td>
+          <td style="color:#facc15;text-align:right;">{_f(t.get('pine_entry_px',''))}</td>
           <td style="color:#e5e7eb;text-align:right;">{_f(t.get('fill_price',''))}</td>
           <td style="color:#34d399;text-align:right;">{_f(t.get('tp_price',''))}</td>
           <td style="color:#f87171;text-align:right;">{_f(t.get('sl_price',''))}</td>
@@ -2835,7 +2883,7 @@ async def dashboard():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Vol Surge 1min — Live Dashboard</title>
+<title>Anand Bot — Live Dashboard (MIN_BODY 50)</title>
 <style>
   *{{margin:0;padding:0;box-sizing:border-box}}
   body{{background:#080c10;color:#e2e8f0;font-family:'Segoe UI',system-ui,monospace;font-size:13px}}
@@ -3111,7 +3159,7 @@ async def dashboard():
 <!-- HEADER -->
 <div class="hdr">
   <div>
-    <h1>⚡ Vol Surge 1min — Live Dashboard</h1>
+    <h1>⚡ Anand Bot — Live Dashboard (MIN_BODY 50)</h1>
     <div style="color:#6b7280;font-size:11px;margin-top:3px;">BTCUSD · Delta Exchange India · <span style="color:#4ade80;font-weight:600;">1m candles</span> · WebSocket-native · <span style="color:#4ade80;">live price SSE ~200ms</span> · page reload 30s · {now_ist}</div>
   </div>
   <div style="text-align:right;display:flex;flex-direction:column;align-items:flex-end;gap:6px;">
@@ -3229,6 +3277,7 @@ async def dashboard():
   <thead id="th-detailed" style="position:sticky;top:0;z-index:2;background:#0d1117;">
     <tr>
       <th>#</th><th>Dir</th><th>Time (IST)</th><th>TF</th>
+      <th style="text-align:right">Signal $</th>
       <th style="text-align:right">Fill $</th>
       <th style="text-align:right">TP $</th>
       <th style="text-align:right">SL $</th>
