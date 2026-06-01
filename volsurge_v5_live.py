@@ -2522,6 +2522,25 @@ async def clear_all_trades():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# ── /admin/restore-jun1-trades ───────────────────────────────────────────────
+@app.get("/admin/restore-jun1-trades")
+async def restore_jun1_trades():
+    """Restore the two 01/06 trades that were accidentally wiped."""
+    HDR = CSV_HEADERS
+    rows = [
+        {"trade_id":"B1780272240203","direction":"BUY","mode":"LIVE","signal_timeframe":"1","signal_tf_bar_time":"1780272180","pine_entry_px":"73771.25","fill_price":"73807.5","entry_slippage_pts":"36.25","sl_price":"73757.5","tp_price":"73832.5","pine_signal_time":"1780272240000","signal_recv_time":"1780272240.2032604","entry_fill_time":"1780272240.9620948","signal_latency_ms":"203.3","entry_latency_ms":"758.8","exit_price":"73832.5","exit_time":"2026-06-01T00:04:24.809427","exit_type":"TP_LIVE","exit_slippage_pts":"0.0","pts":"25.0","pnl_approx":"0.025","python_actual_outcome":"TP","slippage_ratio":"0.725","structure_grade":"DEGRADED","trade_duration_sec":"23.8","monitor_cycles_total":"50","recovery_event":"False","recovery_reason":"","entry_order_id":"1339212891","api_request_time":"1780272240.2084584","api_ack_time":"1780272240.9616084","sl_placed_time":"1780272241.8694277","tp_placed_time":"1780272241.8694277","exit_order_id":"1339212900","exit_fill_px_delta":"73832.5","entry_slippage_pct":"0.0491","chop_avg_tr":"48.046","burst_threshold":"96.092","candle_body":"98.85","atr5_prev":"45.529","sl_dist_engine":"50.0"},
+        {"trade_id":"B1780283100203","direction":"BUY","mode":"LIVE","signal_timeframe":"1","signal_tf_bar_time":"1780283040","pine_entry_px":"73936.0","fill_price":"73953.0","entry_slippage_pts":"17.0","sl_price":"73903.0","tp_price":"73978.0","pine_signal_time":"1780283100000","signal_recv_time":"1780283100.2038224","entry_fill_time":"1780283101.0106242","signal_latency_ms":"203.8","entry_latency_ms":"806.8","exit_price":"73899.5","exit_time":"2026-06-01T03:05:43.769146","exit_type":"SL_SOFTWARE","exit_slippage_pts":"3.5","pts":"-53.5","pnl_approx":"-0.0535","python_actual_outcome":"SL","slippage_ratio":"0.34","structure_grade":"MILD","trade_duration_sec":"42.8","monitor_cycles_total":"100","recovery_event":"False","recovery_reason":"","entry_order_id":"1339353998","api_request_time":"1780283100.2046187","api_ack_time":"1780283101.0102575","sl_placed_time":"1780283101.891382","tp_placed_time":"1780283101.891382","exit_order_id":"","exit_fill_px_delta":"73899.5","entry_slippage_pct":"0.023","chop_avg_tr":"50.232","burst_threshold":"100.464","candle_body":"105.56","atr5_prev":"50.358","sl_dist_engine":"50.0"},
+    ]
+    try:
+        with open(CSV_FILE, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=HDR, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
+        return JSONResponse({"status": "ok", "restored": len(rows)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 # ── /dashboard ────────────────────────────────────────────────────────────────
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
