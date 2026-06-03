@@ -114,7 +114,10 @@ TP_R                   = float(os.getenv("TP_R", "1.3"))
 MAX_SLIPPAGE_RATIO     = float(os.getenv("MAX_SLIPPAGE_RATIO", "0.0"))
 MAX_PRE_ENTRY_SLIP_PTS = float(os.getenv("MAX_PRE_ENTRY_SLIP_PTS", "0.0"))  # legacy — superseded by limit entry
 # Limit entry — GTC limit at signal close price; waits for post-burst pullback
-ENTRY_LIMIT_TIMEOUT_S  = int(os.getenv("ENTRY_LIMIT_TIMEOUT_S",  "45"))   # 1m: 45s (75% of bar); cancel if not filled
+# USE_LIMIT_ENTRY: true → entry via limit@signal-close valid ~1 candle (0 entry slippage, ~33% fill).
+#                  false → market entry at signal close (current default).
+USE_LIMIT_ENTRY        = os.getenv("USE_LIMIT_ENTRY", "false").lower() == "true"
+ENTRY_LIMIT_TIMEOUT_S  = int(os.getenv("ENTRY_LIMIT_TIMEOUT_S",  "45"))   # validity window (set = CANDLE_SECONDS for "1 candle")
 ENTRY_LIMIT_MAX_DRIFT  = float(os.getenv("ENTRY_LIMIT_MAX_DRIFT", "0.0")) # 0 = auto (1.5 × sl_dist); cancel if price runs this far
 # Fixed SL/TP override — set both > 0 to use fixed pts instead of ATR-based
 FIXED_SL_PTS           = float(os.getenv("FIXED_SL_PTS", "150.0"))  # 150pts fixed SL for 1m bot
@@ -123,10 +126,10 @@ MAX_DAILY_LOSS_PTS     = float(os.getenv("MAX_DAILY_LOSS_PTS",     "0"))  # 0=di
 MAX_ACCEPTABLE_SLIP_PTS= float(os.getenv("MAX_ACCEPTABLE_SLIP_PTS","0"))  # 0=disabled; TG alert if total entry+exit slip > this pts
 
 # Config signature appended to every Telegram alert — traces which setup made each trade
-CONFIG_TAG = f"MB{MIN_BODY_PTS:.0f} · {CANDLE_SECONDS//60}m · SL{FIXED_SL_PTS:.0f}/TP{FIXED_TP_PTS:.0f} · burst{VS_BURST_MULT}"
+CONFIG_TAG = f"👤 ANAND · MB{MIN_BODY_PTS:.0f} · {CANDLE_SECONDS//60}m · SL{FIXED_SL_PTS:.0f}/TP{FIXED_TP_PTS:.0f} · burst{VS_BURST_MULT}"
 
-PRICE_INTERVAL = 1   # seconds between position monitor ticks (1s = ~4pt worst-case SL slippage vs 9pt at 2s)
-POS_MON_DELAY  = 3   # seconds to wait after entry before monitor starts
+PRICE_INTERVAL = 0.1  # seconds between position monitor ticks (100ms fallback — minimises software SL slippage)
+POS_MON_DELAY  = 3    # seconds to wait after entry before monitor starts
 
 # ════════════════════════════════════════════════════════════════════════
 # STATE CONSTANTS
@@ -511,6 +514,58 @@ def place_market_order(side: str, size: float, reduce_only: bool = False,
     _loge(f"market order rejected | state={status} | code={err_code}")
     place_market_order._last_error = str(err_code)
     return None
+
+def watch_breakout_entry(
+    side: str,
+    size: float,
+    trigger_price: float,
+    timeout_s: float,
+) -> Optional[dict]:
+    """
+    Breakout entry watcher — no order placed until breakout confirmed.
+    BUY:  fires market order when mark_price >= trigger_price (breaks above signal HIGH)
+    SELL: fires market order when mark_price <= trigger_price (breaks below signal LOW)
+    Returns same dict format as place_limit_entry_order, or None if not triggered.
+    """
+    deadline = time.time() + timeout_s
+    log.info(
+        f"[BREAKOUT_WATCH] {side.upper()} | trigger={trigger_price:.1f} "
+        f"timeout={timeout_s:.0f}s"
+    )
+    tg(
+        f"👤 <b>ANAND BOT</b> | ⏳ <b>BREAKOUT WATCH [{side.upper()}]</b>\n"
+        f"Trigger: <b>{trigger_price:,.1f}</b>\n"
+        f"Waiting up to {int(timeout_s)}s for breakout..."
+    )
+    while time.time() < deadline:
+        time.sleep(0.5)
+        cur = feed.mark_price
+        if cur is None:
+            continue
+        triggered = (cur >= trigger_price) if side.lower() == "buy" else (cur <= trigger_price)
+        if triggered:
+            log.info(f"[BREAKOUT_WATCH] ✅ Triggered! mark={cur:.1f} trigger={trigger_price:.1f} — placing market order")
+            api_req_t = time.time()
+            result = place_market_order(side, size, ref_price=trigger_price)
+            api_ack_t = time.time()
+            if result:
+                fill = result.get("fill_price") or cur
+                return {
+                    "order_id":         str(result.get("order_id", "")),
+                    "fill_price":       fill,
+                    "api_request_time": api_req_t,
+                    "api_ack_time":     api_ack_t,
+                }
+            return None
+        log.debug(f"[BREAKOUT_WATCH] waiting | cur={cur:.1f} trigger={trigger_price:.1f} remaining={deadline-time.time():.0f}s")
+
+    log.warning(f"[BREAKOUT_WATCH] Timeout — no breakout in {timeout_s:.0f}s, trade skipped")
+    tg(
+        f"⏭ <b>BREAKOUT WATCH expired [{side.upper()}]</b>\n"
+        f"No breakout within {int(timeout_s)}s — trade skipped"
+    )
+    return None
+
 
 def place_limit_entry_order(
     side: str,
@@ -1023,7 +1078,7 @@ def _set_open_trade(
     _sl_mode       = f"FIXED {FIXED_SL_PTS:.0f}pts" if FIXED_SL_PTS > 0 else "ATR"
     _tp_mode       = f"FIXED {FIXED_TP_PTS:.0f}pts" if FIXED_TP_PTS > 0 else f"{TP_R}R"
     tg(
-        f"{'📄 PAPER' if PAPER_MODE else '🟢 LIVE'} <b>{d} ENTERED</b> [{CANDLE_SECONDS//60}m WebSocket]\n"
+        f"👤 <b>ANAND BOT</b> | {'📄 PAPER' if PAPER_MODE else '🟢 LIVE'} <b>{d} ENTERED</b> [{CANDLE_SECONDS//60}m WebSocket]\n"
         f"Fill: <b>{fill_price:,.1f}</b> | Slip: {entry_slippage:+.2f}pts\n"
         f"SL: {sl_price:,.1f} [{_sl_mode}] | TP: {tp_price:,.1f} [{_tp_mode}]\n"
         f"Bar close: {_bar_close_ist} IST | Fill: {_fill_ist} IST\n"
@@ -1157,7 +1212,7 @@ def _close_trade(exit_price: float, exit_type: str, exit_slippage: float = 0.0):
     emoji = "✅" if pts > 0 else "🔴"
     _log(f"STATE→CLOSED | {d} exit={exit_price} pts={pts:+.2f} outcome={python_outcome}")
     tg(
-        f"{emoji} <b>{d} CLOSED</b> [{exit_type}]\n"
+        f"👤 <b>ANAND BOT</b> | {emoji} <b>{d} CLOSED</b> [{exit_type}]\n"
         f"Entry: {entry_px:,.1f} → Exit: {exit_price:,.1f}\n"
         f"PnL: <b>{pts:+.2f}pts</b> | Outcome: <b>{python_outcome}</b>\n"
         f"Structure: {trade.get('structure_grade','?')} | Duration: {trade_duration_sec}s\n"
@@ -1388,12 +1443,12 @@ def _process_entry(
     pine_entry_px: float,
     pine_tp: float,
     pine_sl: float,
-    pine_signal_time: int,       # bar close time in ms (Unix)
-    recv_time: float,            # time.time() when engine detected the signal
+    pine_signal_time: int,
+    recv_time: float,
     trade_id: str,
     signal_timeframe: str = "",
     signal_tf_bar_time: int = 0,
-    # v5 signal context (for CSV logging)
+    breakout_trigger_px: float = 0.0,   # real candle HIGH (BUY) or LOW (SELL) — breakout level
     chop_avg_tr: float = 0.0,
     burst_threshold: float = 0.0,
     candle_body: float = 0.0,
@@ -1425,6 +1480,68 @@ def _process_entry(
                 return
             fill_px = round(fill_px, 1)
             _log(f"PAPER fill simulated @ {fill_px}")
+
+        elif USE_LIMIT_ENTRY:
+            # ── BREAKOUT ENTRY MODE ───────────────────────────────────────────
+            # BUY:  watch for mark_price >= signal candle HIGH (momentum continues up)
+            # SELL: watch for mark_price <= signal candle LOW  (momentum continues down)
+            # No order placed until breakout confirmed → market order on trigger.
+            side            = "buy" if d == "BUY" else "sell"
+            close_side      = "sell" if d == "BUY" else "buy"
+            entry_contracts = _btc_to_contracts(LOT_SIZE, pine_entry_px)
+            _trigger        = breakout_trigger_px if breakout_trigger_px > 0 else pine_entry_px
+            _log_lifecycle(trade_id, "ENTRY_SENT", side=side, qty=entry_contracts,
+                           price=_trigger, notes="breakout_watch")
+            result = watch_breakout_entry(side, LOT_SIZE, _trigger,
+                                          timeout_s=ENTRY_LIMIT_TIMEOUT_S)
+            if not result:
+                # not filled within validity window → trade skipped (alert sent inside func)
+                _log(f"[LIMIT_ENTRY] {d} not filled — trade skipped")
+                return
+            entry_order_id   = str(result.get("order_id", ""))
+            api_request_time = result.get("api_request_time")
+            api_ack_time     = result.get("api_ack_time")
+            fill_px          = round(float(result.get("fill_price", pine_entry_px)), 1)
+            entry_fill_time  = time.time()
+
+            # ── Fixed SL/TP from actual fill ──
+            if FIXED_SL_PTS > 0:
+                sl_dist = FIXED_SL_PTS
+            _tp_pts  = FIXED_TP_PTS if FIXED_TP_PTS > 0 else sl_dist * TP_R
+            sl_price = round(fill_px - sl_dist, 1) if d == "BUY" else round(fill_px + sl_dist, 1)
+            tp_price = round(fill_px + _tp_pts, 1) if d == "BUY" else round(fill_px - _tp_pts, 1)
+
+            _mark = feed.mark_price or fetch_price() or fill_px
+            _sl_buffer = max(sl_dist * 0.05, 2.0)
+            if d == "SELL" and sl_price <= _mark:
+                sl_price = round(_mark + _sl_buffer, 1)
+            elif d == "BUY" and sl_price >= _mark:
+                sl_price = round(_mark - _sl_buffer, 1)
+
+            # ── Bracket: server-side SL stop-market + TP limit ──
+            bracket_result = place_bracket_order(d, sl_price, tp_price)
+            if bracket_result and bracket_result.get("bracket_placed"):
+                sl_oid      = bracket_result.get("sl_oid")
+                tp_oid      = bracket_result.get("tp_oid")
+                sl_placed_t = bracket_result.get("placed_time")
+                tp_placed_t = bracket_result.get("placed_time")
+                tg(
+                    f"🔒 <b>BRACKET ORDER PLACED</b> [{d}] (limit entry)\n"
+                    f"Fill: {fill_px:,.1f} (limit — 0 slippage ✓)\n"
+                    f"SL: {sl_price:,.1f} | TP: {tp_price:,.1f}"
+                )
+            else:
+                _logw("[BRACKET] Failed (limit entry) — falling back to TP limit + software SL")
+                sl_result = place_sl_order(close_side, LOT_SIZE, sl_price, entry_contracts)
+                tp_result = place_tp_order(close_side, LOT_SIZE, tp_price, entry_contracts)
+                sl_oid      = sl_result["order_id"]   if sl_result else None
+                sl_placed_t = sl_result["placed_time"] if sl_result else None
+                tp_oid      = tp_result["order_id"]   if tp_result else None
+                tp_placed_t = tp_result["placed_time"] if tp_result else None
+                if not tp_oid:
+                    _loge(f"[TP] TP ORDER FAILED (limit entry) after {d} @ {fill_px}")
+                    tg(f"⚠️ <b>TP FAILED</b> [{d}] — software SL @ {sl_price:,.1f} active")
+            # fall through to shared _set_open_trade + position monitor below
 
         else:
             side            = "buy" if d == "BUY" else "sell"
@@ -1786,7 +1903,7 @@ def on_candle_close(candle: Candle, buffer: deque):
     # If the WS feed died and the bar was force-closed late, sr.ts + 60 will
     # be far in the past. Entering on a 2-min-old signal is wrong — price
     # already moved, Delta rejects the order, and the trade would be stale.
-    bar_close_epoch = sr.ts + 60           # 1m bar: open_ts + 60s = close_ts
+    bar_close_epoch = sr.ts + CANDLE_SECONDS   # open_ts + bar period = close_ts (60s=1m, 300s=5m)
     signal_age_s    = recv_time - bar_close_epoch
     if signal_age_s > MAX_SIGNAL_AGE_S:
         _logw(
@@ -1816,24 +1933,29 @@ def on_candle_close(candle: Candle, buffer: deque):
 
     trade_id = f"{sr.signal[0]}{int(recv_time * 1000)}"
 
+    # Breakout trigger: BUY enters only if price breaks ABOVE signal candle HIGH
+    #                   SELL enters only if price breaks BELOW signal candle LOW
+    _breakout_px = candle.high if sr.signal == "BUY" else candle.low
+
     threading.Thread(
         target=_process_entry,
         kwargs={
-            "signal":            sr.signal,
-            "sl_dist":           sr.sl_dist,
-            "pine_entry_px":     sr.entry_price,
-            "pine_tp":           sr.tp2,
-            "pine_sl":           sr.sl,
-            "pine_signal_time":  (sr.ts + 60) * 1000,   # bar CLOSE Unix ms (start + 1m=60s)
-            "recv_time":         recv_time,
-            "trade_id":          trade_id,
-            "signal_timeframe":  "1",        # 1m candles (CandleFeed candlestick_1m)
-            "signal_tf_bar_time": sr.ts,
+            "signal":              sr.signal,
+            "sl_dist":             sr.sl_dist,
+            "pine_entry_px":       sr.entry_price,
+            "pine_tp":             sr.tp2,
+            "pine_sl":             sr.sl,
+            "pine_signal_time":    (sr.ts + CANDLE_SECONDS) * 1000,
+            "recv_time":           recv_time,
+            "trade_id":            trade_id,
+            "signal_timeframe":    str(CANDLE_SECONDS // 60),
+            "signal_tf_bar_time":  sr.ts,
+            "breakout_trigger_px": _breakout_px,
             # v5 signal context
-            "chop_avg_tr":       state.chop_avg_tr,
-            "burst_threshold":   state.burst_threshold,
-            "candle_body":       state.candle_body,
-            "atr5_prev":         state.atr5_prev,
+            "chop_avg_tr":         state.chop_avg_tr,
+            "burst_threshold":     state.burst_threshold,
+            "candle_body":         state.candle_body,
+            "atr5_prev":           state.atr5_prev,
         },
         daemon=True,
         name=f"entry-{trade_id}",
@@ -1933,6 +2055,7 @@ async def startup():
     asyncio.create_task(_orphan_recovery())
 
     tg(
+        f"👤 <b>ANAND BOT</b>\n"
         f"{'📄 PAPER' if PAPER_MODE else '🟢 LIVE'} <b>Vol Surge v5 started</b>\n"
         f"Signal: WebSocket-native (no TV webhook)\n"
         f"Candles: {'Heikin-Ashi ✓' if USE_HA else 'Regular OHLC'}\n"
