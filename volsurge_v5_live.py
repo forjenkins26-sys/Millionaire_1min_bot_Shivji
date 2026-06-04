@@ -973,6 +973,7 @@ def _set_open_trade(
     # v5-specific signal context
     chop_avg_tr: float = 0.0, burst_threshold: float = 0.0,
     candle_body: float = 0.0, atr5_prev: float = 0.0,
+    breakout_trigger_px: float = 0.0,  # real candle HIGH (BUY) or LOW (SELL) — used for slippage ref
 ):
     global open_trade
     d = direction
@@ -987,7 +988,11 @@ def _set_open_trade(
     else:
         tp_price = pine_tp
 
-    entry_slippage   = round(fill_price - pine_entry_px, 2) if d == "BUY" else round(pine_entry_px - fill_price, 2)
+    # For limit/breakout entries: slippage = fill vs trigger level (HA high/low), not Pine signal close.
+    # pine_entry_px = HA close of signal bar (used for market entries).
+    # breakout_trigger_px = HA high (BUY) or HA low (SELL) — the actual limit price.
+    _ref_px = breakout_trigger_px if breakout_trigger_px > 0 else pine_entry_px
+    entry_slippage   = round(fill_price - _ref_px, 2) if d == "BUY" else round(_ref_px - fill_price, 2)
     # signal_latency_ms: time from bar close to when engine detected it (should be <500ms)
     signal_latency_ms = round((signal_recv_time - pine_signal_time / 1000) * 1000, 1)
     entry_latency_ms  = round((entry_fill_time - signal_recv_time) * 1000, 1)
@@ -1796,6 +1801,7 @@ def _process_entry(
                 burst_threshold=burst_threshold,
                 candle_body=candle_body,
                 atr5_prev=atr5_prev,
+                breakout_trigger_px=breakout_trigger_px,
             )
 
         threading.Thread(target=_position_monitor, daemon=True, name="mon").start()
