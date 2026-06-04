@@ -1939,9 +1939,14 @@ def on_candle_close(candle: Candle, buffer: deque):
 
     trade_id = f"{sr.signal[0]}{int(recv_time * 1000)}"
 
-    # Breakout trigger: BUY enters only if price breaks ABOVE signal candle HIGH
-    #                   SELL enters only if price breaks BELOW signal candle LOW
-    _breakout_px = candle.high if sr.signal == "BUY" else candle.low
+    # Breakout trigger: BUY enters only if price breaks ABOVE signal candle HA-HIGH
+    #                   SELL enters only if price breaks BELOW signal candle HA-LOW
+    # WHY HA candle (not real candle):
+    #   Pine: pLimit := high  on HA chart → high = HA candle HIGH (not real HIGH)
+    #   HA high = max(real_high, ha_open, ha_close) >= real_high
+    #   Using real high would give a lower BUY trigger → enters earlier than Pine intends.
+    #   Fixed: 04-Jun-2026
+    _breakout_px = ha_candle.high if sr.signal == "BUY" else ha_candle.low
 
     threading.Thread(
         target=_process_entry,

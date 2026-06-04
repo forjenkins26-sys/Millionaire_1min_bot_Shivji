@@ -177,6 +177,7 @@ flyctl ssh console -C "curl ifconfig.me" --app millionare-shivji-1min-bot
 | Date | Issue | Status |
 |---|---|---|
 | 04-Jun-2026 | `NameError: breakout_trigger_px not defined` in `_set_open_trade` | ✅ Fixed — added param, pushed commit `3f93efa` |
+| 04-Jun-2026 | Breakout trigger used real candle HIGH/LOW instead of HA candle HIGH/LOW | ✅ Fixed — `_breakout_px = ha_candle.high/low` (Pine: `pLimit := high` on HA chart = HA high, not real high) |
 
 ---
 
@@ -213,6 +214,14 @@ Current live config (SL=15, TP=40, body=50, burst=2.0) is conservative/tight —
 - **Files changed:** `volsurge_v5_live.py`
 - **Commit:** `3f93efa` — pushed to `origin/master`
 - **Deploy:** Auto-deployed via Fly.io GitHub integration
+
+### 04-Jun-2026 ~14:30 IST
+**Bug fix: Breakout trigger used real candle HIGH/LOW instead of HA HIGH/LOW**
+
+- **Problem:** `_breakout_px = candle.high` used real candle's high as BUY trigger. Pine uses `pLimit := high` on HA chart → trigger = HA candle HIGH. HA high = max(real_high, ha_open, ha_close) ≥ real_high. Using real high = lower trigger = bot entered earlier/more often than Pine intends.
+- **Fix:** Changed to `_breakout_px = ha_candle.high if BUY else ha_candle.low`
+- **File:** `volsurge_v5_live.py` line ~1944
+- **Impact:** Bot now matches Pine's breakout trigger exactly. Slightly fewer fills (harder trigger) but higher quality entries.
 
 ### 04-Jun-2026 ~13:15 IST
 **Documentation: Updated Project_Understanding.md**
