@@ -223,4 +223,4 @@ Current live config (SL=15, TP=40, body=50, burst=2.0) is conservative/tight —
 - Added changelog section
 - Added known issues table
 
-<!-- deploy-test: 04-Jun-2026 12:12 IST -->
+<!-- deploy-test: 04-Jun-2026 12:41 IST -->
