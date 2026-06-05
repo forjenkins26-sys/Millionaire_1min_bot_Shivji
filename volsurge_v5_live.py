@@ -95,7 +95,7 @@ SAFETY_FACTOR = float(os.getenv("SIGNAL_SAFETY_FACTOR", "1.0"))
 # Momentum Quality Filter A: Min Absolute Body
 # Blocks signal when candle body < MIN_BODY_PTS (same as Pine useMinBody/minBodyPts).
 USE_MIN_BODY  = True    # Filter ON — block signals with body < min pts
-MIN_BODY_PTS  = float(os.getenv("MIN_BODY_PTS", "50.0"))   # Live: 50 pts (fly.toml)
+MIN_BODY_PTS  = float(os.getenv("MIN_BODY_PTS", "200.0"))  # Live: 200 pts (fly.toml)
 USE_BREAKOUT_CTX = os.getenv("USE_BREAKOUT_CTX", "true").lower() == "true"
 BREAKOUT_CTX_BARS = int(os.getenv("BREAKOUT_CTX_BARS", "5"))
 # Heikin-Ashi mode: MUST match TradingView chart type.
