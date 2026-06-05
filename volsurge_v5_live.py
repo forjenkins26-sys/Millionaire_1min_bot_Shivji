@@ -119,7 +119,7 @@ USE_LIMIT_ENTRY        = os.getenv("USE_LIMIT_ENTRY", "true").lower() == "true"
 ENTRY_LIMIT_TIMEOUT_S  = int(os.getenv("ENTRY_LIMIT_TIMEOUT_S",  "120"))  # 120s = 2 bars on 1m (Pine: limitValidBars=2)
 ENTRY_LIMIT_MAX_DRIFT  = float(os.getenv("ENTRY_LIMIT_MAX_DRIFT", "0.0")) # 0 = auto (1.5 × sl_dist); cancel if price runs this far
 # Fixed SL/TP override — set both > 0 to use fixed pts instead of ATR-based
-FIXED_SL_PTS           = float(os.getenv("FIXED_SL_PTS", "50.0"))   # Live: 50 pts (fly.toml)
+FIXED_SL_PTS           = float(os.getenv("FIXED_SL_PTS", "25.0"))   # Live: 25 pts (fly.toml)
 FIXED_TP_PTS           = float(os.getenv("FIXED_TP_PTS", "50.0"))   # Live: 50 pts (fly.toml)
 MAX_DAILY_LOSS_PTS     = float(os.getenv("MAX_DAILY_LOSS_PTS",     "0"))  # 0=disabled; e.g. 500 = block new entries after -500pts/day
 MAX_ACCEPTABLE_SLIP_PTS= float(os.getenv("MAX_ACCEPTABLE_SLIP_PTS","0"))  # 0=disabled; TG alert if total entry+exit slip > this pts
